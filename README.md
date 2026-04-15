@@ -31,22 +31,22 @@ memory_hog program allocates memory continuously.
 ## Screenshots
 
 ### 1. CPU Hog Running
-![1](screenshots/01.png)
+![1](01.png)
 
 ### 2. Process Check
-![2](screenshots/02.png)
+![2](02.png)
 
 ### 3. Kernel Logs
-![3](screenshots/03.png)
+![3](03.png)
 
 ### 4. Memory Hog Running
-![4](screenshots/04.png)
+![4](04.png)
 
 ### 5. Memory Process
-![5](screenshots/05.png)
+![5](05.png)
 
 ### 6. System Logs
-![6](screenshots/06.png)
+![6](06.png)
 
 ### 7. Combined View
-![7](screenshots/07.png)
+![7](07.png)
