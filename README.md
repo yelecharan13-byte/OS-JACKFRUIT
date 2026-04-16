@@ -7,7 +7,7 @@ VIJAYKUMAR - PES1UG24CS529
 
 
 
-2. Build, Load, and Run Instructions
+## Build, Load, and Run Instructions
 Prerequisites
 Ubuntu 22.04 or 24.04 in a VM (Secure Boot OFF, no WSL)
 sudo apt install -y build-essential linux-headers-$(uname -r)
@@ -91,7 +91,7 @@ dmesg | grep container_monitor | tail -5
 ### 7. Combined View
 ![7](07.png)
 
-. Engineering Analysis
+## Engineering Analysis
 4.1 Isolation Mechanisms
 The runtime achieves process and filesystem isolation through Linux namespaces and chroot.
 
