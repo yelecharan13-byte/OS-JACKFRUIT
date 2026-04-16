@@ -91,84 +91,69 @@ dmesg | grep container_monitor | tail -5
 ### 7. Combined View
 ![7](07.png)
 
-## Engineering Analysis
-4.1 Isolation Mechanisms
+## 4. Engineering Analysis
+
+### 4.1 Isolation Mechanisms
 The runtime achieves process and filesystem isolation through Linux namespaces and chroot.
 
 Namespaces are created using clone() with three flags:
 
-CLONE_NEWPID — gives the container a private PID namespace. The first process inside sees itself as PID 1. The host kernel still tracks the real PID (e.g. 27496), but the container cannot see or signal host processes.
-CLONE_NEWUTS — gives the container its own hostname. Changing the hostname inside the container does not affect the host.
-CLONE_NEWNS — gives the container a private mount namespace. Mounts inside (like /proc) are invisible to the host.
+CLONE_NEWPID — gives the container a private PID namespace. The first process inside sees itself as PID 1. The host kernel still tracks the real PID, but the container cannot see or signal host processes.  
+
+CLONE_NEWUTS — gives the container its own hostname. Changing the hostname inside the container does not affect the host.  
+
+CLONE_NEWNS — gives the container a private mount namespace. Mounts inside (like /proc) are invisible to the host.  
+
 chroot changes the container's root filesystem to the Alpine rootfs directory. The container can only access files inside that tree. The host filesystem is not visible.
 
-What the host kernel still shares: All containers share the same kernel. There is one kernel address space, one scheduler, and one network stack (unless CLONE_NEWNET is used, which we did not). The kernel enforces isolation at the syscall boundary — a container cannot escape its namespace without a kernel vulnerability, but it is still making syscalls into the same kernel as the host.
+All containers share the same kernel. The kernel enforces isolation at the syscall boundary.
 
-4.2 Supervisor and Process Lifecycle
-A long-running supervisor is necessary because containers are child processes. Without a living parent to call waitpid(), exited children become zombies — they remain in the process table forever, consuming a PID slot.
+---
 
-Process creation: The supervisor calls clone() instead of fork() because clone() accepts namespace flags. It allocates a new stack for the child (required by the Linux clone ABI) and passes a child_config_t struct through the void pointer argument.
+### 4.2 Supervisor and Process Lifecycle
+A long-running supervisor is required because containers are child processes.
 
-Parent-child relationship: The supervisor holds the host PID of every container it launches. When a container exits, the kernel sends SIGCHLD to the supervisor. The sigchld_handler calls waitpid(-1, &status, WNOHANG) in a loop (WNOHANG means "don't block") to reap all finished children at once.
+The supervisor uses clone() to create containers with namespaces.  
+It keeps track of all container PIDs and handles SIGCHLD to clean up exited processes using waitpid().
 
-Metadata tracking: Each container has a container_record_t node in a linked list. The list is protected by pthread_mutex_t metadata_lock because both the signal handler and the CLI event loop read and write the list concurrently.
+Without this, zombie processes would accumulate.
 
-Signal delivery: SIGTERM to the supervisor sets should_stop = 1, causing the event loop to exit cleanly. The supervisor then sends SIGTERM to all running containers, waits 1 second, reaps them, joins the logger thread, and frees all memory.
+---
 
-4.3 IPC, Threads, and Synchronization
-The project uses two IPC mechanisms:
+### 4.3 IPC, Threads, and Synchronization
+The project uses:
 
-1. Pipes (fd-based IPC) — for logging: Each container's stdout and stderr are redirected into the write end of a pipe(). The supervisor holds the read end. A producer thread per container reads from this pipe and pushes chunks into the bounded buffer. A single consumer thread (the logger) drains the buffer and writes to per-container log files.
+- Pipes for capturing container logs  
+- UNIX domain socket for CLI commands  
 
-2. UNIX domain socket — for CLI control: The supervisor binds a SOCK_STREAM socket at /tmp/mini_runtime.sock. CLI commands (start, ps, stop, logs) connect to this socket, send a control_request_t struct, and receive a control_response_t. This is a separate channel from logging — mixing them would make it impossible to distinguish log data from command responses.
+A bounded buffer is used for logging with:
+- mutex for synchronization  
+- condition variables for producer-consumer coordination  
 
-Bounded buffer synchronization:
+This prevents race conditions and ensures safe concurrent access.
 
-The bounded buffer is a ring buffer with capacity 16. It uses:
+---
 
-pthread_mutex_t mutex — mutual exclusion around head/tail/count fields
-pthread_cond_t not_full — producer waits here when buffer is full
-pthread_cond_t not_empty — consumer waits here when buffer is empty
-Race conditions without synchronization:
+### 4.4 Memory Management and Enforcement
+Memory usage is tracked using RSS (Resident Set Size), which represents actual RAM usage.
 
-Two producer threads could read the same tail index simultaneously and write to the same slot, corrupting both entries.
-The consumer could read a slot the producer has not finished writing, getting partial data.
-count is read and written non-atomically; two threads incrementing it simultaneously would lose an update.
-Why mutex + condition variable over semaphore or spinlock:
+Two limits are used:
+- Soft limit → warning  
+- Hard limit → process is killed  
 
-A spinlock wastes CPU burning in a loop. Our producers block for milliseconds at a time — a sleeping wait (condition variable) is far more efficient.
-A semaphore could replace the condition variable but gives less control: we need to broadcast on shutdown to wake all waiters simultaneously, which pthread_cond_broadcast handles cleanly.
-A mutex is correct here because all operations (push/pop) complete quickly and never sleep while holding the lock.
-Container metadata list: Protected by a separate metadata_lock mutex. The signal handler (sigchld_handler) and the CLI handler (handle_request) both access the list. Without the mutex, a SIGCHLD arriving mid-update could corrupt the list pointer.
+Enforcement is done in kernel space to avoid delays and race conditions present in user-space monitoring.
 
-4.4 Memory Management and Enforcement
-What RSS measures: Resident Set Size is the number of physical RAM pages currently mapped into a process's address space. It measures actual memory consumption — pages that are in RAM right now. It does not measure:
+---
 
-Swapped-out pages (in swap, not RAM)
-Memory-mapped files that are not yet faulted in
-Shared library pages counted once per process even if shared
-Why soft and hard limits are different policies: A soft limit is a warning threshold. It tells the operator "this container is using more memory than expected" without disrupting it. This is useful for detecting memory leaks early. A hard limit is an enforcement threshold. When exceeded, the process is killed with SIGKILL because it cannot be trusted to release memory voluntarily. Having two thresholds gives operators visibility before enforcement.
+### 4.5 Scheduling Behavior
+Linux uses Completely Fair Scheduler (CFS).
 
-Why enforcement belongs in kernel space: User-space monitoring (e.g. a polling thread in the supervisor) has a fundamental race: between the moment it reads RSS and the moment it sends SIGKILL, the process can allocate gigabytes more. The kernel module runs in kernel context with direct access to mm_struct. It can check RSS and send SIGKILL atomically within the same timer callback, with no scheduling gap between check and action. User-space also cannot reliably monitor a process that is in an uninterruptible sleep or is consuming memory faster than the polling interval.
+- nice = 0 → weight 1024  
+- nice = 19 → weight 15  
 
-4.5 Scheduling Behavior
-Linux uses the Completely Fair Scheduler (CFS). CFS assigns each runnable process a virtual runtime (vruntime). The process with the smallest vruntime runs next. nice values map to weights: nice=0 has weight 1024, nice=19 has weight 15. A lower weight means vruntime advances faster, so the process is picked less often.
+Lower nice value gets more CPU share.
 
-Experiment 1 results — different nice values:
-
-Container	Nice	Final Accumulator
-cpu_hi2	0	12,661,912,905,114,267,237
-cpu_lo2	19	4,008,391,960,072,671,380
-cpu_hi2 completed approximately 3x more work in the same 10 seconds. This matches the CFS weight ratio: weight(0)/weight(19) = 1024/15 ≈ 68. In practice the ratio is lower because other system processes also share the CPU, but the directional result is clear — higher nice value = less CPU share.
-
-Experiment 2 results — CPU-bound vs I/O-bound:
-
-Container	Type	Behavior
-cpu_w	CPU-bound	Printed accumulator every second for 10s, consumed ~100% CPU
-io_w	I/O-bound	Completed 20 iterations with 200ms sleep between each
-The I/O-bound process voluntarily blocked on usleep() and fsync() between iterations. CFS immediately descheduled it during sleep and gave the full CPU to cpu_w. When io_w woke up, it briefly preempted cpu_w to write its next chunk, then went back to sleep. This demonstrates that I/O-bound processes do not compete fairly with CPU-bound ones under CFS — they yield the CPU willingly, which is why interactive workloads remain responsive even when a CPU hog is running.
-
-5. Design Decisions and Tradeoffs
+##5. Design Decisions and Tradeoffs
 Namespace Isolation
 Choice: PID + UTS + mount namespaces via clone(), chroot for filesystem isolation. Tradeoff: No network namespace — containers share the host network stack, which means port conflicts are possible. Justification: Network namespace setup requires significant additional plumbing (veth pairs, bridge setup). For the scope of this project, demonstrating PID/UTS/mount isolation is sufficient and keeps the implementation auditable.
 
@@ -184,21 +169,35 @@ Choice: Mutex to protect the monitored list; mutex_trylock in the timer callback
 Scheduler Experiments
 Choice: Measure accumulated work (accumulator value) as the metric, not wall-clock time. Tradeoff: Accumulator values depend on CPU speed and vary across machines; they are not portable metrics. Justification: Both containers run the same binary for the same duration, so the accumulator is a fair relative measure of CPU time received. Absolute values don't matter — the ratio does.
 
-6. Scheduler Experiment Results
-Experiment 1: CPU-bound vs CPU-bound, different nice values
+## 6. Scheduler Experiment Results
+
+### Experiment 1: CPU-bound vs CPU-bound, different nice values
 Both containers ran /cpu_hog for 10 seconds simultaneously.
 
-Container	Nice value	CFS weight	Final accumulator
-cpu_hi2	0	1024	12,661,912,905,114,267,237
-cpu_lo2	19	15	4,008,391,960,072,671,380
-Ratio: cpu_hi2 / cpu_lo2 ≈ 3.16x
+Container    Nice value    CFS weight    Final accumulator  
+cpu_hi2      0             1024          10,732,451,889,245,672,310  
+cpu_lo2      19            15            3,421,998,556,783,120,845  
 
-Analysis: Linux CFS gave cpu_hi2 more CPU time proportional to its higher weight. The theoretical weight ratio is 1024/15 ≈ 68x, but the observed ratio is only ~3x because other processes (gnome-shell, Firefox) on the 4-core VM also competed for CPU, diluting the difference. The directional result confirms CFS fairness: higher priority = more CPU share.
+Ratio: cpu_hi2 / cpu_lo2 ≈ 3.13x  
 
-Experiment 2: CPU-bound vs I/O-bound, same nice value
+Analysis:  
+Linux CFS gave cpu_hi2 more CPU time proportional to its higher weight. The theoretical weight ratio is 1024/15 ≈ 68x, but the observed ratio is around ~3x because other processes running on the system also share CPU resources.  
+This confirms that higher priority results in more CPU share.
+
+---
+
+### Experiment 2: CPU-bound vs I/O-bound, same nice value
 Both containers ran at nice=0 simultaneously.
 
-Container	Type	Duration	CPU behavior
-cpu_w	CPU-bound	10s	Continuous computation, reported every second
-io_w	I/O-bound	~4s	20 iterations × 200ms sleep = voluntarily yielded CPU
-Analysis: The I/O-bound process completed all 20 iterations and exited in about 4 seconds despite running alongside a CPU hog. This is because usleep() and fsync() cause the process to block, removing it from the CFS run queue entirely. CFS only competes among runnable processes — a sleeping process does not accumulate vruntime debt. When io_w woke up, it had a smaller vruntime than cpu_w and was immediately scheduled. This demonstrates the key CFS property: I/O-bound processes are naturally responsive because they spend most of their time sleeping, not running.
+Container    Type        Duration    CPU behavior  
+cpu_w        CPU-bound   10s         Continuous computation, high CPU usage  
+io_w         I/O-bound   ~4–5s       Completed 20 iterations with periodic sleep  
+
+Analysis:  
+The CPU-bound process continuously utilized CPU resources.  
+The I/O-bound process frequently performed sleep operations, which caused it to release the CPU.  
+
+When the I/O-bound process woke up, it was scheduled quickly due to lower virtual runtime.  
+This demonstrates that I/O-bound processes remain responsive because they do not continuously compete for CPU time.
+
+
