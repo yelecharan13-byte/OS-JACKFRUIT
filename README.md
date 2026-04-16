@@ -153,7 +153,7 @@ Linux uses Completely Fair Scheduler (CFS).
 
 Lower nice value gets more CPU share.
 
-##5. Design Decisions and Tradeoffs
+### Design Decisions and Tradeoffs
 Namespace Isolation
 Choice: PID + UTS + mount namespaces via clone(), chroot for filesystem isolation. Tradeoff: No network namespace — containers share the host network stack, which means port conflicts are possible. Justification: Network namespace setup requires significant additional plumbing (veth pairs, bridge setup). For the scope of this project, demonstrating PID/UTS/mount isolation is sufficient and keeps the implementation auditable.
 
